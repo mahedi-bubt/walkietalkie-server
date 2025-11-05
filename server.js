@@ -1,5 +1,6 @@
 const http = require('http');
 const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid'); // Add this package
 
 const server = http.createServer((req, res) => {
    res.writeHead(200, {
@@ -24,74 +25,147 @@ const wss = new WebSocket.Server({
 });
 
 let clients = new Map();
-let clientIdCounter = 1;
+let rooms = new Map(); // NEW: For room management
+
+// NEW: Generate unique client ID that persists across reconnects
+function generateClientId() {
+   return uuidv4();
+}
 
 wss.on('connection', (ws, req) => {
-   const clientId = clientIdCounter++;
-   clients.set(ws, { id: clientId, room: 'default' });
+   // NEW: Try to get existing client ID from query params or generate new
+   const url = new URL(req.url, `http://${req.headers.host}`);
+   const clientId = url.searchParams.get('clientId') || generateClientId();
+   const roomId = url.searchParams.get('roomId') || 'default';
 
-   console.log(
-      `✅ Client ${clientId} connected from: ${req.socket.remoteAddress}`
+   // NEW: Check if this client already exists (reconnection)
+   const existingClient = Array.from(clients.values()).find(
+      client => client.id === clientId && client.room === roomId
    );
 
-   // Send welcome message
+   if (existingClient) {
+      // Replace the old connection with new one
+      clients.delete(existingClient.ws);
+      console.log(`🔄 Client ${clientId} reconnected in room ${roomId}`);
+   } else {
+      console.log(`✅ New client ${clientId} connected to room ${roomId}`);
+   }
+
+   // Store client info
+   clients.set(ws, {
+      id: clientId,
+      room: roomId,
+      ws: ws,
+   });
+
+   // Initialize room if not exists
+   if (!rooms.has(roomId)) {
+      rooms.set(roomId, new Set());
+   }
+   rooms.get(roomId).add(clientId);
+
+   // Send welcome message with client ID for reconnection
    ws.send(
       JSON.stringify({
          type: 'welcome',
-         message: `👋 Welcome to Walkie-Talkie Server! You are client ${clientId}`,
+         message: `👋 Welcome to Walkie-Talkie Server!`,
          clientId: clientId,
+         roomId: roomId,
       })
    );
 
-   // Send current user count to all clients
-   broadcastUserCount();
+   // Send current user count to all clients in the same room
+   broadcastUserCount(roomId);
 
    ws.on('message', message => {
       try {
          const data = JSON.parse(message);
-         console.log(`📨 Received from client ${clientId}: ${data.type}`);
+         const clientData = clients.get(ws);
+
+         if (!clientData) return;
+
+         console.log(
+            `📨 Received from client ${clientData.id} in room ${clientData.room}: ${data.type}`
+         );
 
          // Handle different message types
          switch (data.type) {
             case 'offer':
+               // NEW: Broadcast offer to all other clients in the same room
+               broadcastToRoom(ws, data, clientData.room);
+               break;
+
             case 'answer':
             case 'ice-candidate':
-               // Broadcast to all other clients for WebRTC signaling
-               broadcastToOthers(ws, data);
+               // NEW: Send to specific target client for peer connection
+               if (data.targetClientId) {
+                  sendToClient(data.targetClientId, data);
+               } else {
+                  // Fallback: broadcast to room (for backward compatibility)
+                  broadcastToRoom(ws, data, clientData.room);
+               }
                break;
 
             case 'ping':
                ws.send(JSON.stringify({ type: 'pong' }));
                break;
 
+            case 'hangup':
+               // NEW: Broadcast hangup to room
+               broadcastToRoom(ws, data, clientData.room);
+               break;
+
             default:
                console.log(
-                  `❓ Unknown message type from client ${clientId}: ${data.type}`
+                  `❓ Unknown message type from client ${clientData.id}: ${data.type}`
                );
          }
       } catch (error) {
          // If not JSON, treat as text message
-         console.log(`📢 Message from client ${clientId}: ${message}`);
+         const clientData = clients.get(ws);
+         console.log(`📢 Message from client ${clientData.id}: ${message}`);
 
-         // Broadcast text messages to all other clients
-         broadcastToOthers(ws, {
-            type: 'message',
-            text: message.toString(),
-            clientId: clientId,
-         });
+         // Broadcast text messages to all other clients in room
+         broadcastToRoom(
+            ws,
+            {
+               type: 'message',
+               text: message.toString(),
+               clientId: clientData.id,
+            },
+            clientData.room
+         );
       }
    });
 
    ws.on('close', () => {
-      console.log(`❌ Client ${clientId} disconnected`);
-      clients.delete(ws);
-      broadcastUserCount();
+      const clientData = clients.get(ws);
+      if (clientData) {
+         console.log(
+            `❌ Client ${clientData.id} disconnected from room ${clientData.room}`
+         );
+         clients.delete(ws);
+
+         // Remove from room
+         const room = rooms.get(clientData.room);
+         if (room) {
+            room.delete(clientData.id);
+            if (room.size === 0) {
+               rooms.delete(clientData.room);
+            }
+         }
+
+         broadcastUserCount(clientData.room);
+      }
    });
 
    ws.on('error', error => {
-      console.error(`💥 WebSocket error for client ${clientId}:`, error);
+      const clientData = clients.get(ws);
+      console.error(`💥 WebSocket error for client ${clientData.id}:`, error);
       clients.delete(ws);
-      broadcastUserCount();
+      if (clientData) {
+         broadcastUserCount(clientData.room);
+      }
    });
 
    // Heartbeat to keep connection alive
@@ -106,13 +180,23 @@ wss.on('connection', (ws, req) => {
    });
 });
 
-function broadcastToOthers(sender, message) {
+// NEW: Broadcast to all other clients in the same room
+function broadcastToRoom(sender, message, roomId) {
    const senderData = clients.get(sender);
 
    clients.forEach((clientData, client) => {
-      if (client !== sender && client.readyState === WebSocket.OPEN) {
+      if (
+         client !== sender &&
+         clientData.room === roomId &&
+         client.readyState === WebSocket.OPEN
+      ) {
          try {
-            client.send(JSON.stringify(message));
+            client.send(
+               JSON.stringify({
+                  ...message,
+                  senderClientId: senderData?.id, // Include sender ID
+               })
+            );
          } catch (error) {
             console.error('Error sending to client:', error);
          }
@@ -120,17 +204,36 @@ function broadcastToOthers(sender, message) {
    });
 }
 
-function broadcastUserCount() {
-   const userCount = clients.size;
-   console.log(`👥 Broadcasting user count: ${userCount}`);
+// NEW: Send to specific client
+function sendToClient(targetClientId, message) {
+   const targetClient = Array.from(clients.entries()).find(
+      ([_, clientData]) => clientData.id === targetClientId
+   );
+
+   if (targetClient && targetClient[0].readyState === WebSocket.OPEN) {
+      try {
+         targetClient[0].send(JSON.stringify(message));
+      } catch (error) {
+         console.error(`Error sending to client ${targetClientId}:`, error);
+      }
+   }
+}
+
+// NEW: Broadcast user count per room
+function broadcastUserCount(roomId) {
+   const room = rooms.get(roomId);
+   const userCount = room ? room.size : 0;
+
+   console.log(`👥 Broadcasting user count for room ${roomId}: ${userCount}`);
 
    const countMessage = JSON.stringify({
       type: 'user-count',
       count: userCount,
+      roomId: roomId,
    });
 
    clients.forEach((clientData, client) => {
-      if (client.readyState === WebSocket.OPEN) {
+      if (clientData.room === roomId && client.readyState === WebSocket.OPEN) {
          try {
             client.send(countMessage);
          } catch (error) {
