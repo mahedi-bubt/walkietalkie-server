@@ -1,6 +1,6 @@
 const http = require('http');
 const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid'); // Add this package
+const { v4: uuidv4 } = require('uuid');
 
 const server = http.createServer((req, res) => {
    res.writeHead(200, {
@@ -15,160 +15,138 @@ const server = http.createServer((req, res) => {
       return;
    }
 
-   res.end('🎵 Walkie-Talkie WebRTC Signaling Server is running!');
+   res.end('🎵 Walkie-Talkie WebRTC Signaling Server (1-to-1)');
 });
 
-// Create WebSocket server
-const wss = new WebSocket.Server({
-   server,
-   clientTracking: true,
-});
+const wss = new WebSocket.Server({ server });
 
-let clients = new Map();
-let rooms = new Map(); // NEW: For room management
-
-// NEW: Generate unique client ID that persists across reconnects
-function generateClientId() {
-   return uuidv4();
-}
+// Store active peer connections
+const peers = new Map(); // clientId -> { ws, partnerId, roomId }
 
 wss.on('connection', (ws, req) => {
-   // NEW: Try to get existing client ID from query params or generate new
    const url = new URL(req.url, `http://${req.headers.host}`);
-   const clientId = url.searchParams.get('clientId') || generateClientId();
+   const clientId = url.searchParams.get('clientId') || uuidv4();
    const roomId = url.searchParams.get('roomId') || 'default';
+   const partnerId = url.searchParams.get('partnerId'); // Specific partner to connect to
 
-   // NEW: Check if this client already exists (reconnection)
-   const existingClient = Array.from(clients.values()).find(
-      client => client.id === clientId && client.room === roomId
-   );
+   console.log(`✅ Client ${clientId} connected to room ${roomId}`);
 
-   if (existingClient) {
-      // Replace the old connection with new one
-      clients.delete(existingClient.ws);
-      console.log(`🔄 Client ${clientId} reconnected in room ${roomId}`);
-   } else {
-      console.log(`✅ New client ${clientId} connected to room ${roomId}`);
-   }
+   // Store peer information
+   peers.set(clientId, { ws, roomId, partnerId: partnerId || null });
 
-   // Store client info
-   clients.set(ws, {
-      id: clientId,
-      room: roomId,
-      ws: ws,
-   });
-
-   // Initialize room if not exists
-   if (!rooms.has(roomId)) {
-      rooms.set(roomId, new Set());
-   }
-   rooms.get(roomId).add(clientId);
-
-   // Send welcome message with client ID for reconnection
+   // Send welcome with client ID
    ws.send(
       JSON.stringify({
          type: 'welcome',
-         message: `👋 Welcome to Walkie-Talkie Server!`,
          clientId: clientId,
          roomId: roomId,
       })
    );
 
-   // Send current user count to all clients in the same room
-   broadcastUserCount(roomId);
+   // Notify if partner is available
+   if (partnerId && peers.has(partnerId)) {
+      const partner = peers.get(partnerId);
+      if (partner.roomId === roomId) {
+         ws.send(
+            JSON.stringify({
+               type: 'partner-available',
+               partnerId: partnerId,
+            })
+         );
+      }
+   }
 
    ws.on('message', message => {
       try {
          const data = JSON.parse(message);
-         const clientData = clients.get(ws);
+         const sender = peers.get(clientId);
 
-         if (!clientData) return;
+         if (!sender) return;
 
-         console.log(
-            `📨 Received from client ${clientData.id} in room ${clientData.room}: ${data.type}`
-         );
+         console.log(`📨 ${data.type} from ${clientId}`);
 
-         // Handle different message types
          switch (data.type) {
             case 'offer':
-               // NEW: Broadcast offer to all other clients in the same room
-               broadcastToRoom(ws, data, clientData.room);
-               break;
-
             case 'answer':
             case 'ice-candidate':
-               // NEW: Send to specific target client for peer connection
-               if (data.targetClientId) {
-                  sendToClient(data.targetClientId, data);
-               } else {
-                  // Fallback: broadcast to room (for backward compatibility)
-                  broadcastToRoom(ws, data, clientData.room);
+            case 'hangup':
+               // Forward to specific partner
+               if (data.targetClientId && peers.has(data.targetClientId)) {
+                  const targetPeer = peers.get(data.targetClientId);
+                  if (targetPeer.ws.readyState === WebSocket.OPEN) {
+                     targetPeer.ws.send(
+                        JSON.stringify({
+                           ...data,
+                           senderClientId: clientId,
+                        })
+                     );
+                  }
                }
+               break;
+
+            case 'list-partners':
+               // List all available partners in the same room
+               const roomPartners = Array.from(peers.entries())
+                  .filter(
+                     ([id, peer]) =>
+                        id !== clientId &&
+                        peer.roomId === roomId &&
+                        peer.ws.readyState === WebSocket.OPEN
+                  )
+                  .map(([id]) => id);
+
+               ws.send(
+                  JSON.stringify({
+                     type: 'partners-list',
+                     partners: roomPartners,
+                  })
+               );
                break;
 
             case 'ping':
                ws.send(JSON.stringify({ type: 'pong' }));
                break;
 
-            case 'hangup':
-               // NEW: Broadcast hangup to room
-               broadcastToRoom(ws, data, clientData.room);
-               break;
-
             default:
-               console.log(
-                  `❓ Unknown message type from client ${clientData.id}: ${data.type}`
-               );
+               console.log(`❓ Unknown message type: ${data.type}`);
          }
       } catch (error) {
-         // If not JSON, treat as text message
-         const clientData = clients.get(ws);
-         console.log(`📢 Message from client ${clientData.id}: ${message}`);
-
-         // Broadcast text messages to all other clients in room
-         broadcastToRoom(
-            ws,
-            {
-               type: 'message',
-               text: message.toString(),
-               clientId: clientData.id,
-            },
-            clientData.room
-         );
+         console.error('Error parsing message:', error);
       }
    });
 
    ws.on('close', () => {
-      const clientData = clients.get(ws);
-      if (clientData) {
-         console.log(
-            `❌ Client ${clientData.id} disconnected from room ${clientData.room}`
-         );
-         clients.delete(ws);
+      console.log(`❌ Client ${clientId} disconnected`);
 
-         // Remove from room
-         const room = rooms.get(clientData.room);
-         if (room) {
-            room.delete(clientData.id);
-            if (room.size === 0) {
-               rooms.delete(clientData.room);
+      // Notify partner about disconnection
+      const peer = peers.get(clientId);
+      if (peer) {
+         // Find and notify all partners that were connected to this client
+         peers.forEach((otherPeer, otherId) => {
+            if (
+               otherId !== clientId &&
+               otherPeer.ws.readyState === WebSocket.OPEN &&
+               (otherPeer.partnerId === clientId || !otherPeer.partnerId)
+            ) {
+               otherPeer.ws.send(
+                  JSON.stringify({
+                     type: 'partner-disconnected',
+                     clientId: clientId,
+                  })
+               );
             }
-         }
-
-         broadcastUserCount(clientData.room);
+         });
       }
+
+      peers.delete(clientId);
    });
 
    ws.on('error', error => {
-      const clientData = clients.get(ws);
-      console.error(`💥 WebSocket error for client ${clientData.id}:`, error);
-      clients.delete(ws);
-      if (clientData) {
-         broadcastUserCount(clientData.room);
-      }
+      console.error(`💥 WebSocket error for ${clientId}:`, error);
+      peers.delete(clientId);
    });
 
-   // Heartbeat to keep connection alive
+   // Heartbeat
    const heartbeat = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
          ws.send(JSON.stringify({ type: 'heartbeat' }));
@@ -180,78 +158,22 @@ wss.on('connection', (ws, req) => {
    });
 });
 
-// NEW: Broadcast to all other clients in the same room
-function broadcastToRoom(sender, message, roomId) {
-   const senderData = clients.get(sender);
-
-   clients.forEach((clientData, client) => {
-      if (
-         client !== sender &&
-         clientData.room === roomId &&
-         client.readyState === WebSocket.OPEN
-      ) {
-         try {
-            client.send(
-               JSON.stringify({
-                  ...message,
-                  senderClientId: senderData?.id, // Include sender ID
-               })
-            );
-         } catch (error) {
-            console.error('Error sending to client:', error);
-         }
-      }
-   });
+// Get all peers in a room
+function getRoomPeers(roomId) {
+   return Array.from(peers.entries())
+      .filter(
+         ([id, peer]) =>
+            peer.roomId === roomId && peer.ws.readyState === WebSocket.OPEN
+      )
+      .map(([id]) => id);
 }
 
-// NEW: Send to specific client
-function sendToClient(targetClientId, message) {
-   const targetClient = Array.from(clients.entries()).find(
-      ([_, clientData]) => clientData.id === targetClientId
-   );
-
-   if (targetClient && targetClient[0].readyState === WebSocket.OPEN) {
-      try {
-         targetClient[0].send(JSON.stringify(message));
-      } catch (error) {
-         console.error(`Error sending to client ${targetClientId}:`, error);
-      }
-   }
-}
-
-// NEW: Broadcast user count per room
-function broadcastUserCount(roomId) {
-   const room = rooms.get(roomId);
-   const userCount = room ? room.size : 0;
-
-   console.log(`👥 Broadcasting user count for room ${roomId}: ${userCount}`);
-
-   const countMessage = JSON.stringify({
-      type: 'user-count',
-      count: userCount,
-      roomId: roomId,
-   });
-
-   clients.forEach((clientData, client) => {
-      if (clientData.room === roomId && client.readyState === WebSocket.OPEN) {
-         try {
-            client.send(countMessage);
-         } catch (error) {
-            console.error('Error sending user count:', error);
-         }
-      }
-   });
-}
-
-// For Render, Railway, or local hosting
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, '0.0.0.0', () => {
-   console.log(`🚀 Walkie-Talkie Server running on port ${PORT}`);
+   console.log(`🚀 1-to-1 Walkie-Talkie Server running on port ${PORT}`);
    console.log(`📍 WebSocket: ws://localhost:${PORT}`);
-   console.log(`📍 HTTP: http://localhost:${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
    console.log('SIGTERM received, shutting down gracefully');
    wss.close(() => {
